@@ -89,6 +89,30 @@ Reasons:
 - Straightforward DuckDB integration
 - Easy deployment as a self-contained executable
 
+The tool is named **quarry** and is distributed as a global .NET tool (`dotnet tool install -g`), invoked as `quarry`.
+
+The solution should use C# 15 union types where they model alternatives naturally (for example command results, parse outcomes and errors).
+
+### Prerequisites
+
+DuckDB is embedded through the `DuckDB.NET.Data.Full` NuGet package, which bundles the native DuckDB library for each platform. No separate DuckDB installation (such as the `duckdb` CLI) is required.
+
+Quarry only accesses the network through explicit, user-invoked setup commands. Normal operation (`index`, `search`, `open` and so on) never does. The README documents prerequisites and setup.
+
+#### DuckDB extensions
+
+Extensions not built into DuckDB (for example `fts`) are installed explicitly:
+
+```bash
+quarry duckdb install-extension fts
+```
+
+This runs `INSTALL` through quarry's embedded DuckDB engine, so the extension always matches the bundled DuckDB version. Rerun it after upgrading quarry to a DuckDB version that requires a new download. Extensions use DuckDB's default, version-specific extension directory (`~/.duckdb/extensions/<version>/<platform>`), shared with a DuckDB CLI of the same version.
+
+At runtime, quarry loads extensions with automatic installation disabled. If a required extension is missing, the error tells the user to run `quarry duckdb install-extension <name>`.
+
+No extensions are required in version 1.
+
 ### Database
 
 DuckDB
@@ -133,7 +157,7 @@ The indexer must never modify source files.
 
 ### 3. Support Multiple Knowledge Sources
 
-The system is a knowledge catalog, not a single notes index.
+The system is a knowledge catalog, not a single quarry index.
 
 Example sources:
 
@@ -158,6 +182,14 @@ Search should return:
 
 It should avoid returning entire repositories or unnecessarily large files.
 
+### 5. Paths
+
+File paths and heading paths are stored with `/` separators on every platform. Paths are matched exactly (case-sensitive), so behaviour is identical on Windows, macOS and Linux.
+
+### 6. Foreign Keys
+
+The schema uses DuckDB foreign keys. Because DuckDB does not support cascading deletes, dependent rows must be deleted in order: `links`, `metadata`, `sections`, then `notes`. Before a note is deleted, incoming links from other notes have their `target_note_id` set to null so they become unresolved rather than blocking the delete.
+
 ## Database Schema
 
 ### Sources
@@ -168,20 +200,9 @@ Represents each indexed repository.
 CREATE TABLE sources (
     source_id   BIGINT PRIMARY KEY,
     source_name VARCHAR NOT NULL UNIQUE,
-    root_path   VARCHAR NOT NULL,
-    source_type VARCHAR,
-    weight      INTEGER NOT NULL DEFAULT 100
+    root_path   VARCHAR NOT NULL
 );
 ```
-
-Example source types:
-
-- `personal`
-- `wiki`
-- `adr`
-- `runbook`
-
-The weight can later be used when ranking search results.
 
 ### Notes
 
@@ -219,6 +240,10 @@ This simplifies:
 - AI citations
 - Deduplication
 
+When a changed document is re-indexed, its `notes` row is updated in place (matched by `document_key`) so that `note_id` remains stable. Its derived rows (sections, metadata, outgoing links) are replaced.
+
+A document that is moved or renamed within a source is treated as a deletion of the old document and an addition of a new one.
+
 ### Sections
 
 The section is the primary retrieval unit.
@@ -229,6 +254,7 @@ CREATE TABLE sections (
     note_id       BIGINT NOT NULL,
     heading_path  VARCHAR,
     heading_level INTEGER,
+    ordinal       INTEGER NOT NULL,
     content       VARCHAR NOT NULL,
     FOREIGN KEY (note_id) REFERENCES notes(note_id)
 );
@@ -242,7 +268,11 @@ Investigation > Findings
 Investigation > Findings > SQL Server
 ```
 
-Text before the first heading should also be retained, either as a document preamble section or under the document title.
+Text before the first heading is retained as a preamble section with an empty `heading_path` and `heading_level` 0.
+
+`ordinal` is the section's position within the document. It preserves document order and disambiguates sections that share the same heading path.
+
+A section's `content` contains only its own text, not the content of its child sections. A section that is empty, or only contains sub-sections, is still stored, with `content` set to an empty string.
 
 ### Metadata
 
@@ -325,29 +355,25 @@ Only changed files should be reprocessed.
 
 Sources should be configured outside the database schema so new directories can be added without code changes.
 
+All user configuration lives in a JSON file at `~/.quarry/config.json`. It holds anything the user needs to set or wants to override. The file is managed through CLI commands (for example `quarry source add` for sources and a `quarry duckdb` command group for DuckDB settings), but remains human-editable.
+
 Example configuration:
 
 ```json
 {
-  "database": "knowledge.duckdb",
+  "database": "~/.quarry/quarry.duckdb",
   "sources": [
     {
       "name": "personal",
-      "path": "D:/Notes",
-      "type": "personal",
-      "weight": 80
+      "path": "D:/Notes"
     },
     {
       "name": "wiki",
-      "path": "D:/Repos/TeamWiki",
-      "type": "wiki",
-      "weight": 100
+      "path": "D:/Repos/TeamWiki"
     },
     {
       "name": "adrs",
-      "path": "D:/Repos/Architecture/ADRs",
-      "type": "adr",
-      "weight": 120
+      "path": "D:/Repos/Architecture/ADRs"
     }
   ]
 }
@@ -369,6 +395,10 @@ Useful optional source settings may later include:
 ### Step 1: Load configured sources
 
 Read all source definitions and ensure corresponding records exist in the `sources` table.
+
+If a configured source path cannot be found, or a source exists in the database but has been removed from the configuration, print a warning. Do not delete its indexed data.
+
+Quarry should support relocating a source that has moved; relocating updates the source's path in the configuration.
 
 ### Step 2: Discover Markdown files
 
@@ -423,7 +453,7 @@ Replacing all derived rows for a changed document is acceptable for the initial 
 
 ### Step 6: Handle deleted files
 
-Remove notes and dependent index data for files that no longer exist under a configured source.
+Remove notes and dependent index data for files that no longer exist under a configured source whose root path is available. Missing sources are not purged (see Step 1).
 
 ### Step 7: Resolve links
 
@@ -443,18 +473,34 @@ The CLI is the primary interface for humans and AI agents.
 
 Commands should support predictable, non-interactive output and meaningful process exit codes.
 
+Query commands (`search`, `open`, `related`, `recent`, `stats`) open the database read-only. Only `index` writes to it.
+
+Configuration commands:
+
+```bash
+quarry source add <path> --name <name>
+quarry source list
+quarry source remove <name> [--purge]     # --purge also deletes indexed data
+quarry source relocate <name> <new-path>  # explicit; moves are not detected automatically
+quarry config path
+quarry config show
+quarry config set <key> <value>
+quarry duckdb version
+quarry duckdb install-extension <name>
+```
+
 ### Index
 
 Index all configured sources:
 
 ```bash
-notes index
+quarry index
 ```
 
 Index a specific source:
 
 ```bash
-notes index --source personal
+quarry index --source personal
 ```
 
 Suggested output:
@@ -471,7 +517,7 @@ Errors: 0
 Search all sources:
 
 ```bash
-notes search "duckdb"
+quarry search "duckdb"
 ```
 
 Suggested result:
@@ -480,7 +526,6 @@ Suggested result:
 [personal] investigations/data-platform.md
 Document key: personal:investigations/data-platform.md
 Heading: Investigation > Findings
-Score: 87
 
 DuckDB performed better than ...
 ```
@@ -488,7 +533,7 @@ DuckDB performed better than ...
 Search only one source:
 
 ```bash
-notes search "retention" --source wiki
+quarry search "retention" --source wiki
 ```
 
 Useful options:
@@ -507,7 +552,7 @@ JSON output is important for reliable agent consumption.
 Display a complete note using its stable identifier:
 
 ```bash
-notes open personal:investigations/sql-retention.md
+quarry open personal:investigations/sql-retention.md
 ```
 
 Useful options:
@@ -522,7 +567,7 @@ Useful options:
 Show directly related documents using resolved links and backlinks:
 
 ```bash
-notes related personal:investigations/sql-retention.md
+quarry related personal:investigations/sql-retention.md
 ```
 
 Results may span all configured sources.
@@ -532,7 +577,7 @@ Results may span all configured sources.
 Show recently modified notes:
 
 ```bash
-notes recent
+quarry recent
 ```
 
 Useful options:
@@ -548,7 +593,7 @@ Useful options:
 Show catalog statistics:
 
 ```bash
-notes stats
+quarry stats
 ```
 
 Example:
@@ -589,32 +634,9 @@ A multi-term query should distinguish between:
 - All-term matches
 - Any-term matches
 
-Exact phrases and all-term matches should generally rank above loose any-term matches.
+### Result ordering
 
-### Ranking
-
-Use an understandable scoring model with positive signals such as:
-
-- Exact phrase match
-- Title match
-- Heading match
-- Filename or path match
-- Section body match
-- Number of matched query terms
-- Source weight
-- Optional modification-recency bonus
-
-Example source weights:
-
-```text
-ADR Repository     120
-Runbooks           100
-Team Wiki           90
-Personal Notes      80
-Daily Notes         40
-```
-
-Weights must be configurable and should act as ranking signals rather than completely suppressing lower-weight sources.
+There is no numeric scoring. Results are ordered deterministically by match category: exact phrase matches first, then all-term matches, then any-term matches. Ties are broken by a stable order (for example most recently modified first, then document key and section order).
 
 ### Search result requirements
 
@@ -626,13 +648,12 @@ Each result should include enough information for an agent to decide whether to 
 - Title
 - Heading path
 - Short excerpt
-- Score
 
 Search excerpts should highlight or otherwise clearly expose matched terms in human-readable output. JSON output should retain the unformatted excerpt and matched terms separately.
 
 ## Link Extraction and Resolution
 
-Support clearly recognizable link forms first:
+Version 1 supports two explicit link forms:
 
 ```markdown
 [[Project X]]
@@ -642,15 +663,17 @@ Support clearly recognizable link forms first:
 [Retention strategy](architecture/retention.md)
 ```
 
-```markdown
-architecture/retention.md
-```
-
-```markdown
-ADR-023
-```
+Bare text such as `architecture/retention.md` or `ADR-023` is not detected as a link in version 1.
 
 Link extraction and link resolution should be separate steps.
+
+Resolution rules:
+
+1. Targets are resolved within the linking document's own source first, then across other sources.
+2. Markdown links resolve by relative path. Wiki links resolve by filename first, then by title.
+3. A `#anchor` suffix is stripped for resolution but retained in `raw_target`.
+4. A target matching more than one document is left unresolved (`target_note_id` is null) and remains visible as unresolved.
+5. All links are re-resolved on every index run, so links to newly added documents become resolved.
 
 This enables:
 
@@ -659,8 +682,6 @@ This enables:
 - Cross-source navigation
 - Unresolved-link reporting
 - Related-content discovery
-
-Automatic detection of arbitrary filename-like text should be conservative to avoid creating excessive false links.
 
 ## Knowledge Graph Benefits
 
@@ -686,26 +707,30 @@ Version 1 only needs direct outgoing links and backlinks. Recursive graph traver
 
 The intended agent workflow is:
 
-1. Run `notes search` with a focused query.
+1. Run `quarry search` with a focused query.
 2. Review concise section-level results.
-3. Run `notes open` for the most relevant document or section.
-4. Optionally run `notes related` to discover supporting material.
+3. Run `quarry open` for the most relevant document or section.
+4. Optionally run `quarry related` to discover supporting material.
 
 Example:
 
 ```bash
-notes search "sql retention partition" --limit 5 --format json
-notes open personal:investigations/sql-retention.md --format text
-notes related personal:investigations/sql-retention.md --format json
+quarry search "sql retention partition" --limit 5 --format json
+quarry open personal:investigations/sql-retention.md --format text
+quarry related personal:investigations/sql-retention.md --format json
 ```
 
-The project should include a short agent instruction file explaining:
+`quarry --help` serves both humans and agents. Besides listing commands, it explains:
 
 - When to use the CLI
 - How to formulate focused searches
 - Why search should precede broad filesystem scans
 - When to open a complete note
 - How to cite returned document keys and heading paths
+
+## Testing
+
+The solution includes automated tests written with MSTest and AwesomeAssertions.
 
 ## Error Handling
 
@@ -725,7 +750,7 @@ The application is local-first.
 Version 1 should:
 
 - Read only configured directories.
-- Avoid network access.
+- Avoid network access, except for explicit setup commands such as `quarry duckdb install-extension`.
 - Avoid sending note content to external services.
 - Avoid modifying source documents.
 - Store the DuckDB database at a configurable local path.
@@ -755,7 +780,7 @@ SELECT
     value,
     count(*) AS usage_count
 FROM metadata
-WHERE key = 'tag'
+WHERE key = 'tags'
 GROUP BY value
 ORDER BY usage_count DESC;
 ```
@@ -836,7 +861,7 @@ Version 1 will not:
 - Run a background database service.
 - Provide a custom MCP server.
 - Generate embeddings.
-- Require network or cloud access.
+- Require network or cloud access during normal operation.
 - Implement semantic search.
 - Parse every possible Markdown extension.
 - Infer arbitrary relationships using AI.
@@ -867,15 +892,15 @@ The initial version is successful if:
 6. Implement change and deletion detection.
 7. Parse titles, preambles, headings, and sections.
 8. Persist notes and sections transactionally.
-9. Implement `notes index`.
-10. Implement basic keyword ranking and `notes search`.
+9. Implement `quarry index`.
+10. Implement basic keyword search with deterministic result ordering and `quarry search`.
 11. Add deterministic text and JSON output.
-12. Implement `notes open`.
+12. Implement `quarry open`.
 13. Extract Markdown links and wiki-style links.
-14. Resolve links and implement `notes related`.
+14. Resolve links and implement `quarry related`.
 15. Add frontmatter and metadata extraction.
-16. Implement `notes recent` and `notes stats`.
-17. Add source weighting and search filters.
+16. Implement `quarry recent` and `quarry stats`.
+17. Add search filters.
 18. Evaluate DuckDB full-text search against the baseline.
 19. Evaluate whether embeddings are needed based on observed search failures.
 
